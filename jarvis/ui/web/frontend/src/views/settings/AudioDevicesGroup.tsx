@@ -1,0 +1,173 @@
+import { useState } from "react";
+import { Headphones, Mic, RefreshCw, Volume2 } from "lucide-react";
+import {
+  useAudioDevices,
+  type AudioDeviceEntry,
+} from "@/hooks/useAudioDevices";
+import { useEventStore } from "@/store/events";
+import { useT } from "@/i18n";
+import { BrandedSelect } from "@/components/ui/select";
+
+/**
+ * "Audio devices" card inside the Settings view: one dropdown for the OUTPUT
+ * device (where Jarvis's voice plays) and one for the MICROPHONE (what Jarvis
+ * listens with). The first option is always "Automatic (recommended)" — the
+ * auto-headset resolver; concrete entries are physical devices by display
+ * name (stable across reboots, unlike device indices). A pick saves
+ * immediately and applies live when safe; a device connected after app start
+ * is activated on the next start. The picker rescans on OS device-change
+ * events, while the button remains a manual fallback. On a host without audio
+ * hardware the card degrades to a caption instead of empty dropdowns.
+ */
+export function AudioDevicesGroup() {
+  const t = useT();
+  const { config, loading, error, refetch, select } = useAudioDevices();
+  const pushToast = useEventStore((s) => s.pushToast);
+  const [saving, setSaving] = useState<"output" | "input" | null>(null);
+
+  async function onSelect(kind: "output" | "input", device: string) {
+    setSaving(kind);
+    try {
+      const res = await select(kind, device);
+      pushToast(
+        "success",
+        t(
+          kind === "output"
+            ? "settings_view.audio_devices.output_saved_toast"
+            : "settings_view.audio_devices.input_saved_toast",
+        ),
+      );
+      if (res.restart_required) {
+        pushToast("warning", t("settings_view.audio_devices.restart_caption"));
+      }
+    } catch (e) {
+      pushToast("error", (e as Error).message);
+    } finally {
+      setSaving(null);
+    }
+  }
+
+  const autoValue = config?.auto_value ?? "auto-headset";
+
+  return (
+    <div className="mt-2 rounded-lg border border-border bg-card p-4">
+      <div className="flex items-start gap-3">
+        <Headphones className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center justify-between gap-4">
+            <h4 className="font-display text-sm font-semibold">
+              {t("settings_view.audio_devices.title")}
+            </h4>
+            <button
+              type="button"
+              onClick={() => void refetch()}
+              disabled={loading}
+              title={t("settings_view.audio_devices.rescan")}
+              aria-label={t("settings_view.audio_devices.rescan")}
+              className="text-muted-foreground hover:text-foreground disabled:opacity-50"
+            >
+              <RefreshCw
+                className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`}
+              />
+            </button>
+          </div>
+          <p className="mt-1 text-xs text-muted-foreground">
+            {t("settings_view.audio_devices.description")}
+          </p>
+
+          {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
+
+          {config && !config.available ? (
+            <p className="mt-3 text-xs text-muted-foreground">
+              {t("settings_view.audio_devices.none_found")}
+            </p>
+          ) : (
+            <>
+              <DevicePicker
+                icon={<Volume2 className="h-3.5 w-3.5 text-muted-foreground" />}
+                label={t("settings_view.audio_devices.output_label")}
+                testId="audio-output-select"
+                devices={config?.outputs ?? []}
+                selected={config?.selected_output ?? autoValue}
+                autoValue={autoValue}
+                autoLabel={t("settings_view.audio_devices.auto_option")}
+                defaultSuffix={t("settings_view.audio_devices.default_suffix")}
+                disabled={loading || saving !== null}
+                onSelect={(device) => void onSelect("output", device)}
+              />
+              <DevicePicker
+                icon={<Mic className="h-3.5 w-3.5 text-muted-foreground" />}
+                label={t("settings_view.audio_devices.input_label")}
+                testId="audio-input-select"
+                devices={config?.inputs ?? []}
+                selected={config?.selected_input ?? autoValue}
+                autoValue={autoValue}
+                autoLabel={t("settings_view.audio_devices.auto_option")}
+                defaultSuffix={t("settings_view.audio_devices.default_suffix")}
+                disabled={loading || saving !== null}
+                onSelect={(device) => void onSelect("input", device)}
+              />
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DevicePicker({
+  icon,
+  label,
+  testId,
+  devices,
+  selected,
+  autoValue,
+  autoLabel,
+  defaultSuffix,
+  disabled,
+  onSelect,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  testId: string;
+  devices: AudioDeviceEntry[];
+  selected: string;
+  autoValue: string;
+  autoLabel: string;
+  defaultSuffix: string;
+  disabled: boolean;
+  onSelect: (device: string) => void;
+}) {
+  // A persisted name whose device is currently unplugged still shows as the
+  // selected value (an extra option) so the UI never lies about the config;
+  // the backend resolver falls back to automatic until it reappears.
+  const known = devices.some((d) => d.name === selected);
+  const showOrphan = selected !== autoValue && !known;
+
+  return (
+    <>
+      <label className="mt-4 flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+        {icon}
+        {label}
+      </label>
+      <BrandedSelect
+        testId={testId}
+        value={selected}
+        onValueChange={onSelect}
+        ariaLabel={label}
+        disabled={disabled}
+        className="mt-1"
+        options={[
+          { value: autoValue, label: autoLabel },
+          ...devices.map((device) => ({
+            value: device.name,
+            label: device.is_default
+              ? `${device.name} ${defaultSuffix}`
+              : device.name,
+          })),
+          ...(showOrphan ? [{ value: selected, label: selected }] : []),
+        ]}
+      />
+    </>
+  );
+}

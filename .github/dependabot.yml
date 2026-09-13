@@ -1,0 +1,72 @@
+# Dependabot configuration for PersonalJarvis/PersonalJarvis.
+#
+# Wave-5 audit Finding 4 (repo hygiene): the main repo had no dependabot
+# configuration, so vulnerable transitive deps in pip and unmaintained
+# GitHub Actions could land silently. This file enables weekly updates
+# for both ecosystems with PRs grouped per ecosystem to keep noise down.
+#
+# All Dependabot PRs land as PRs (never auto-merge) — the supply-chain
+# pinning discipline (40-char SHA pins for actions, SHA-256 pins for
+# downloaded binaries) requires a human to validate the new SHA + hash
+# before merging. See install/TRUST_ROOT.md §6+§7 for the bumping
+# procedure.
+
+version: 2
+updates:
+  # GitHub Actions — the supply-chain critical path. Every action in
+  # .github/workflows/*.yml is pinned by 40-char commit SHA (per the
+  # AP from CVE-2025-30066). Dependabot will propose SHA bumps weekly;
+  # review the diff carefully before merging (read TRUST_ROOT.md §7).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:00"
+      timezone: "Europe/Berlin"
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - github-actions
+      - supply-chain
+    commit-message:
+      prefix: deps
+      include: scope
+
+  # Python (pip) — VERSION UPDATES ARE OFF ON PURPOSE (2026-08-22).
+  #
+  # `requirements.txt` in this repo is a PLATFORM-UNIVERSAL lockfile, produced by
+  #   uv pip compile --universal --generate-hashes --python-version 3.11   #       --output-file=requirements.txt requirements.in
+  # `--universal` emits the per-OS environment markers that let ONE lockfile
+  # install correctly on Windows, macOS and Linux. Dependabot recompiles without
+  # it, so every pip PR it opened here arrived with those markers stripped —
+  # `colorama ; sys_platform == 'win32'` lost its condition, the Apple-Silicon
+  # `onnxruntime` and `av` entries vanished, `audioop-lts` lost its
+  # `python_version >= '3.13'` guard. Each of those PRs failed the blocking
+  # deps-sync gate by construction and none was ever mergeable (#62-#65, #101).
+  #
+  # Worse than unmergeable: the grouped PR also proposed bumps that the
+  # portable-install matrix proves would brick advertised platforms — vosk
+  # 0.3.45 (no macOS wheel exists) and ddgs 9.14.4 (pulls brotli, which has no
+  # Windows-ARM64 wheel). Dependabot cannot see those constraints; the matrix
+  # gate can.
+  #
+  # `open-pull-requests-limit: 0` disables VERSION updates only. Dependabot
+  # SECURITY updates are configured separately in the repository settings and
+  # still fire, so advisories keep reaching the repo — they are then serviced by
+  # hand through the compile command above, which is also what the header of
+  # `requirements.in` instructs.
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:00"
+      timezone: "Europe/Berlin"
+    open-pull-requests-limit: 0
+    labels:
+      - dependencies
+      - python
+    commit-message:
+      prefix: deps
+      include: scope

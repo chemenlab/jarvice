@@ -1,0 +1,330 @@
+"""Unit tests for the pure section-health rollup core.
+
+Guards the two pure functions the ``/api/providers/section-health`` endpoint
+composes, plus the status vocabulary itself. The I/O orchestration (resolving the
+active provider, running the real connectivity test) is exercised separately; here
+we only pin the rules so the tab indicator can never silently change meaning.
+"""
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+
+from jarvis.brain import provider_test
+from jarvis.brain import section_health as sh
+from jarvis.ui.web.provider_spec import PROVIDERS
+
+
+class TestSectionStatusForTest:
+    def test_missing_credential_is_needs_setup_regardless_of_test(self) -> None:
+        # No key stored → the tab is "not set up", even if a stale test string is
+        # passed in. Missing always wins over any test outcome.
+        assert sh.section_status_for_test(None, configured=False) == sh.NEEDS_SETUP
+        assert sh.section_status_for_test("ok", configured=False) == sh.NEEDS_SETUP
+        assert sh.section_status_for_test("bad_key", configured=False) == sh.NEEDS_SETUP
+
+    def test_configured_and_ok_is_ok(self) -> None:
+        assert sh.section_status_for_test("ok", configured=True) == sh.OK
+
+    def test_configured_but_not_tested_is_unknown(self) -> None:
+        # Honesty: a stored key we haven't called yet must not claim "ok".
+        assert sh.section_status_for_test(None, configured=True) == sh.UNKNOWN
+
+    def test_test_not_configured_is_needs_setup(self) -> None:
+        # The live call itself found no key — treat as not set up, never a red error.
+        assert sh.section_status_for_test("not_configured", configured=True) == sh.NEEDS_SETUP
+
+    @pytest.mark.parametrize(
+        "bad",
+        ["bad_key", "no_credits", "rate_limited", "model_unavailable", "unreachable", "error"],
+    )
+    def test_every_failing_test_status_is_error(self, bad: str) -> None:
+        assert sh.section_status_for_test(bad, configured=True) == sh.ERROR
+
+    def test_covers_every_provider_test_status(self) -> None:
+        # Anti-drift: every status the provider test can emit must map to a
+        # defined section bucket (no unmapped/silently-dropped outcome).
+        for status in provider_test.PROVIDER_TEST_STATUSES:
+            mapped = sh.section_status_for_test(status, configured=True)
+            assert mapped in sh.SECTION_HEALTH_STATUSES
+
+
+class TestAggregate:
+    def test_empty_is_unknown(self) -> None:
+        assert sh.aggregate([]) == sh.UNKNOWN
+
+    def test_single_passthrough(self) -> None:
+        assert sh.aggregate([sh.OK]) == sh.OK
+        assert sh.aggregate([sh.NEEDS_SETUP]) == sh.NEEDS_SETUP
+
+    def test_error_beats_everything(self) -> None:
+        assert sh.aggregate([sh.OK, sh.NEEDS_SETUP, sh.ERROR]) == sh.ERROR
+        assert sh.aggregate([sh.ERROR, sh.UNKNOWN]) == sh.ERROR
+
+    def test_needs_setup_beats_ok_and_unknown(self) -> None:
+        assert sh.aggregate([sh.OK, sh.NEEDS_SETUP]) == sh.NEEDS_SETUP
+        assert sh.aggregate([sh.UNKNOWN, sh.NEEDS_SETUP]) == sh.NEEDS_SETUP
+
+    def test_ok_beats_unknown(self) -> None:
+        assert sh.aggregate([sh.UNKNOWN, sh.OK]) == sh.OK
+
+
+def test_vocabulary_is_exactly_four() -> None:
+    assert set(sh.SECTION_HEALTH_STATUSES) == {sh.OK, sh.NEEDS_SETUP, sh.ERROR, sh.UNKNOWN}
+    assert len(sh.SECTION_HEALTH_STATUSES) == 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spec", PROVIDERS, ids=lambda spec: spec.id)
+async def test_every_catalog_provider_health_is_bound_to_its_exact_id(
+    spec, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The generic guard covers every Brain, TTS, STT, Realtime and wording card.
+
+    What is under test is the BINDING (a tier's health names the exact provider
+    it came from), so every way a card can be judged is stubbed healthy here:
+    the shared probe, the on-device readiness check that answers for keyless
+    cards, and the wording probe that owns the dictation tier. A card that
+    reached a real provider instead would make this a connectivity test of the
+    machine it runs on.
+    """
+    from jarvis import codex_app_server
+    from jarvis.dictation import polish_probe
+    from jarvis.ui.web import provider_routes
+
+    monkeypatch.setattr(provider_routes, "_is_credential_present", lambda *args: True)
+
+    async def _subscription_ready(_binary_path=None):
+        return True
+
+    monkeypatch.setattr(
+        codex_app_server,
+        "codex_subscription_login_ready",
+        _subscription_ready,
+    )
+    # The subscription-realtime card is judged from a live status snapshot of the
+    # local Codex app-server, not from a stored credential. Left unstubbed that is
+    # a real call to whatever machine runs the suite: it answers "busy" while a
+    # status check is in flight and "not_installed" on a host without the CLI, so
+    # the card would be graded on this machine's Codex state instead of on the
+    # binding under test.
+    monkeypatch.setattr(
+        provider_routes,
+        "_codex_subscription_status_payload",
+        lambda _binary_path=None: {"connected": True, "reason_code": None},
+    )
+    # On-device cards ask the disk whether engine + weights are really there.
+    # On a machine that never installed them that is an honest "needs setup" —
+    # true, and not what this test is about.
+    monkeypatch.setattr(
+        provider_routes,
+        "_local_runtime_payload",
+        lambda _spec: {"ready": True, "detail": "installed"},
+    )
+
+    async def _probe(selected, cfg, **kwargs):
+        return SimpleNamespace(status="ok", detail="")
+
+    async def _polish_probe(family, cfg, **kwargs):
+        return SimpleNamespace(status="ok", detail="")
+
+    monkeypatch.setattr(provider_test, "run_provider_test", _probe)
+    monkeypatch.setattr(polish_probe, "probe_polish_family", _polish_probe)
+
+    result = await provider_routes._tier_section_health(SimpleNamespace(), spec)
+
+    assert result.status == sh.OK
+    assert result.subject_id == spec.id
+
+
+def test_health_fingerprint_covers_every_model_selection_surface() -> None:
+    """Every model-bearing API surface supersedes an older health snapshot."""
+    from jarvis.ui.web import provider_routes as pr
+
+    # ``tool_model`` is the canonical Tool-Model field; the real
+    # BrainProviderConfig exposes ``cu_model`` only as a property alias of it,
+    # so the fingerprint reads (and this fake carries) the canonical name.
+    openrouter = SimpleNamespace(model="brain-a", tool_model="cu-a")
+    realtime = SimpleNamespace(model="realtime-a", voice="voice-a")
+    cfg = SimpleNamespace(
+        brain=SimpleNamespace(
+            providers={"openrouter": openrouter, "openai-realtime": realtime},
+            worker=SimpleNamespace(model="worker-a"),
+        ),
+        tts=SimpleNamespace(model="tts-a", voice_de="de-a", voice_en="en-a"),
+        stt=SimpleNamespace(model="stt-a"),
+    )
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(telephony_manager=None))
+    )
+    subjects = {
+        "brain": "openrouter",
+        "computer-use": "openrouter",
+        "tts": "openrouter-tts",
+        "stt": "openrouter-stt",
+        "realtime": "openai-realtime",
+        "subagents": "openrouter",
+        "advanced": None,
+    }
+    baseline = pr._section_health_fingerprint(request, cfg, subjects)
+
+    mutations = (
+        (openrouter, "model"),
+        (openrouter, "tool_model"),
+        (cfg.tts, "model"),
+        (cfg.tts, "voice_de"),
+        (cfg.tts, "voice_en"),
+        (cfg.stt, "model"),
+        (realtime, "model"),
+        (realtime, "voice"),
+        (cfg.brain.worker, "model"),
+    )
+    for owner, field in mutations:
+        original = getattr(owner, field)
+        setattr(owner, field, f"{original}-changed")
+        assert pr._section_health_fingerprint(request, cfg, subjects) != baseline
+        setattr(owner, field, original)
+
+    cfg.tts.model_extra = {"cartesia": {"model_id": "sonic-new"}}
+    assert pr._section_health_fingerprint(request, cfg, subjects) != baseline
+
+
+class TestSubagentSectionHealth:
+    """Live-honest Sub-Agents tab health (2026-07-06 incident: the tab stayed
+    green while every worker spawn 401'd on an expired OAuth token)."""
+
+    def _cfg(self, provider: str = "claude-api"):
+        class _Sub:  # minimal cfg.brain.worker stand-in
+            pass
+
+        sub = _Sub()
+        sub.provider = provider
+
+        class _Brain:
+            worker = sub
+            primary = "openrouter"
+
+        class _Cfg:
+            brain = _Brain()
+
+        return _Cfg()
+
+    def test_selected_usable_is_ok(self, monkeypatch) -> None:
+        from jarvis.ui.web import provider_routes as pr
+
+        monkeypatch.setattr(pr, "_worker_usable", lambda p: True)
+        monkeypatch.setattr(pr, "_worker_flagged_dead", lambda p: False)
+        health = pr._jarvis_agent_section_health(self._cfg())
+        assert health.status == sh.OK
+        assert health.subject_id == "claude-api"
+
+    def test_selected_dead_with_fallback_is_needs_setup(self, monkeypatch) -> None:
+        from jarvis.ui.web import provider_routes as pr
+
+        monkeypatch.setattr(pr, "_worker_usable", lambda p: True)
+        monkeypatch.setattr(pr, "_worker_flagged_dead", lambda p: True)
+        monkeypatch.setattr(
+            "jarvis.missions.init.reachable_worker_families", lambda: ["codex"]
+        )
+        health = pr._jarvis_agent_section_health(self._cfg())
+        assert health.status == sh.NEEDS_SETUP
+        assert health.reason == "degraded"
+        assert "codex" in health.detail
+
+    def test_usage_capped_codex_selected_is_degraded(self, monkeypatch) -> None:
+        """BUG-042 shape: selected provider codex, ChatGPT usage cap active —
+        the tab must NOT stay green while the factory skips codex."""
+        from jarvis.ui.web import provider_routes as pr
+
+        monkeypatch.setattr(pr, "_worker_usable", lambda p: True)
+        monkeypatch.setattr(
+            "jarvis.codex_auth_state.codex_needs_reauth", lambda: False
+        )
+        monkeypatch.setattr(
+            "jarvis.codex_quota_state.codex_in_quota_cooldown",
+            lambda **_k: True,
+        )
+        monkeypatch.setattr(
+            "jarvis.missions.init.reachable_worker_families", lambda: ["openrouter"]
+        )
+        health = pr._jarvis_agent_section_health(self._cfg(provider="codex"))
+        assert health.status == sh.NEEDS_SETUP
+        assert health.reason == "degraded"
+
+    def test_nothing_reachable_is_error(self, monkeypatch) -> None:
+        from jarvis.ui.web import provider_routes as pr
+
+        monkeypatch.setattr(pr, "_worker_usable", lambda p: False)
+        monkeypatch.setattr(pr, "_worker_flagged_dead", lambda p: False)
+        monkeypatch.setattr(
+            "jarvis.missions.init.reachable_worker_families", lambda: []
+        )
+        health = pr._jarvis_agent_section_health(self._cfg())
+        assert health.status == sh.ERROR
+        assert health.reason == "no_provider"
+        assert health.subject_id == "claude-api"
+
+    def test_degraded_label_says_subscription_for_oauth_user(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """2026-07-10 report: the banner blamed 'Claude (API-Key)' although the
+        user runs the worker on the Claude subscription login — the degraded
+        message must name the auth mode actually in play."""
+        import json
+
+        from jarvis import claude_credentials
+        from jarvis.claude_auth import ClaudeAuthService, ClaudeAuthStatus
+        from jarvis.ui.web import provider_routes as pr
+
+        (tmp_path / ".credentials.json").write_text(
+            json.dumps(
+                {
+                    "claudeAiOauth": {
+                        "accessToken": "sk-ant-oat01-x",
+                        "expiresAt": 1.0,  # expired-in-place — still an OAuth user
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            claude_credentials, "claude_config_dirs", lambda: [tmp_path]
+        )
+        monkeypatch.setattr(
+            ClaudeAuthService,
+            "status",
+            lambda self: ClaudeAuthStatus(installed=True, connected=False),
+        )
+        monkeypatch.setattr(pr, "_worker_usable", lambda p: False)
+        monkeypatch.setattr(pr, "_worker_flagged_dead", lambda p: True)
+        monkeypatch.setattr(
+            "jarvis.missions.init.reachable_worker_families", lambda: ["codex"]
+        )
+        health = pr._jarvis_agent_section_health(self._cfg())
+        assert "Claude (subscription)" in health.detail
+        assert "API-Key" not in health.detail
+
+    def test_degraded_label_keeps_api_key_for_keyed_user(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        from jarvis import claude_credentials
+        from jarvis.claude_auth import ClaudeAuthService, ClaudeAuthStatus
+        from jarvis.ui.web import provider_routes as pr
+
+        # No OAuth bearer anywhere → the user really is on the API-key path.
+        monkeypatch.setattr(
+            claude_credentials, "claude_config_dirs", lambda: [tmp_path]
+        )
+        monkeypatch.setattr(
+            ClaudeAuthService,
+            "status",
+            lambda self: ClaudeAuthStatus(installed=True, connected=False),
+        )
+        monkeypatch.setattr(pr, "_worker_usable", lambda p: False)
+        monkeypatch.setattr(pr, "_worker_flagged_dead", lambda p: True)
+        monkeypatch.setattr(
+            "jarvis.missions.init.reachable_worker_families", lambda: ["codex"]
+        )
+        health = pr._jarvis_agent_section_health(self._cfg())
+        assert "Claude (API-Key)" in health.detail

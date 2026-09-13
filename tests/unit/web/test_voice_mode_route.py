@@ -1,0 +1,300 @@
+"""Task 7 — the browser-voice connect gate, inverted to default OFF.
+
+``_browser_voice_enabled`` now serves the /ws/audio socket only when the user
+has explicitly opted into a voice surface: realtime mode ([voice].mode ==
+"realtime") or the classic bridge ([browser_voice].enabled == True). A missing
+[browser_voice] section is False, not True (the old default-ON contract).
+
+NOTE: a later task (T8) appends settings-route handler tests to this same
+file — keep additions here additive and self-contained.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from jarvis.browser_voice.route import _browser_voice_enabled
+from jarvis.ui.web.settings_routes import router
+
+
+def test_gate_default_off_when_pipeline_and_no_browser_voice():
+    cfg = SimpleNamespace(voice=SimpleNamespace(mode="pipeline"))
+    assert _browser_voice_enabled(cfg) is False
+
+
+def test_gate_on_for_realtime_mode():
+    cfg = SimpleNamespace(voice=SimpleNamespace(mode="realtime"))
+    assert _browser_voice_enabled(cfg) is True
+
+
+def test_gate_on_for_explicit_classic_browser_voice():
+    cfg = SimpleNamespace(
+        voice=SimpleNamespace(mode="pipeline"), browser_voice=SimpleNamespace(enabled=True)
+    )
+    assert _browser_voice_enabled(cfg) is True
+
+
+# ---------------------------------------------------------------------------
+# Task 8 — GET/PUT /api/settings/voice-mode route handlers.
+# ---------------------------------------------------------------------------
+
+
+def _app(mode="pipeline", key="sk-x", monkeypatch=None):
+    app = FastAPI()
+    app.include_router(router)
+    app.state.config = SimpleNamespace(voice=SimpleNamespace(mode=mode))
+    return app
+
+
+def test_get_voice_mode(monkeypatch):
+    import jarvis.realtime.factory as rf
+
+    def openai_only(candidates):
+        keys = {c[0] for c in candidates}
+        return "sk-x" if "openai_api_key" in keys else None
+
+    monkeypatch.setattr(rf, "get_secret_any", openai_only)
+    client = TestClient(_app(mode="realtime"))
+    r = client.get("/api/settings/voice-mode")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["mode"] == "realtime"
+    assert body["realtime_available"] is True
+    assert body["requires_webrtc_offer"] is False
+    assert body["transport_offer_ready"] is None
+    assert body["transport_offer_detail"] is None
+    assert body["active_provider"] == "openai-realtime"
+    # Sidebar display fields: registry label + the catalog-default model (no
+    # pin configured in this app fixture).
+    assert body["active_provider_label"] == "OpenAI Realtime"
+    assert body["active_model"] == "gpt-realtime"
+    assert body["active_model_label"] == "GPT Realtime (default)"
+    assert body["session_active"] is False
+    assert body["active_session_mode"] is None
+
+
+def test_get_voice_mode_reports_browser_offer_capability(monkeypatch):
+    from jarvis.ui.web import settings_routes
+
+    monkeypatch.setattr(
+        settings_routes,
+        "_realtime_available_provider",
+        lambda _cfg: "openai-realtime",
+    )
+    monkeypatch.setattr(
+        settings_routes,
+        "_realtime_requires_webrtc_offer",
+        lambda _cfg: True,
+    )
+    async def _offer_ready(_required: bool) -> bool:
+        return True
+
+    monkeypatch.setattr(
+        settings_routes,
+        "_realtime_transport_offer_ready",
+        _offer_ready,
+    )
+
+
+    body = TestClient(_app(mode="realtime")).get("/api/settings/voice-mode").json()
+
+    assert body["active_provider"] == "openai-realtime"
+    assert body["active_model"] == "gpt-realtime"
+    assert body["active_model_label"] == "GPT Realtime (default)"
+    assert body["requires_webrtc_offer"] is True
+    assert body["transport_offer_ready"] is True
+    assert body["transport_offer_detail"] == "Embedded desktop WebRTC offer is ready."
+
+
+def test_get_voice_mode_reports_stable_subscription_profile(monkeypatch):
+    from jarvis.platform import capabilities
+    from jarvis.ui.web import provider_routes
+
+    monkeypatch.setattr(
+        provider_routes,
+        "_codex_subscription_status_payload",
+        lambda _binary: {
+            "connected": True,
+            "reason_code": "ready",
+        },
+    )
+    monkeypatch.setattr(
+        capabilities,
+        "detect_capabilities",
+        lambda: SimpleNamespace(display_present=True),
+    )
+    app = _app(mode="realtime")
+    app.state.config.voice.profile = "codex-subscription-voice"
+    app.state.config.brain = SimpleNamespace(realtime=None, providers={})
+    app.state.config.stt = SimpleNamespace(provider="nemotron-local")
+    app.state.config.tts = SimpleNamespace(provider="piper-local")
+    app.state.speech_pipeline = object()
+
+    body = TestClient(app).get("/api/settings/voice-mode").json()
+
+    assert body["mode"] == "pipeline"
+    assert body["profile"] == "codex-subscription-voice"
+    assert body["active_provider"] == "codex-subscription-realtime"
+    assert body["active_model"] == "subscription-text"
+    assert body["active_model_label"] == "Codex App Server (subscription text)"
+    assert body["requires_webrtc_offer"] is False
+    assert body["subscription_voice_capability"]["available"] is True
+
+
+def test_get_voice_mode_cross_family_gemini_only(monkeypatch):
+    """Feature A2: realtime_available must NOT be OpenAI-only — a user with
+    only a Gemini key gets realtime_available=true, active_provider=gemini-live."""
+    import jarvis.realtime.factory as rf
+
+    def only_gemini(candidates: tuple[tuple[str, str | None], ...]) -> str | None:
+        keys = {c[0] for c in candidates}
+        return "sk-x" if "gemini_api_key" in keys else None
+
+    monkeypatch.setattr(rf, "get_secret_any", only_gemini)
+    client = TestClient(_app(mode="pipeline"))
+    r = client.get("/api/settings/voice-mode")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["realtime_available"] is True
+    assert body["active_provider"] == "gemini-live"
+    assert body["active_provider_label"] == "Gemini Live"
+    assert body["active_model"] == "gemini-3.1-flash-live-preview"
+
+
+def test_get_voice_mode_reports_pinned_realtime_model(monkeypatch):
+    """A model pinned in [brain.providers.<id>].model outranks the catalog
+    default in the sidebar display fields."""
+    import jarvis.realtime.factory as rf
+
+    def only_gemini(candidates):
+        keys = {c[0] for c in candidates}
+        return "sk-x" if "gemini_api_key" in keys else None
+
+    monkeypatch.setattr(rf, "get_secret_any", only_gemini)
+    app = _app(mode="realtime")
+    app.state.config.brain = SimpleNamespace(
+        providers={
+            "gemini-live": SimpleNamespace(
+                model="gemini-2.5-flash-native-audio-latest", voice=""
+            )
+        }
+    )
+    body = TestClient(app).get("/api/settings/voice-mode").json()
+    assert body["active_provider"] == "gemini-live"
+    assert body["active_model"] == "gemini-2.5-flash-native-audio-latest"
+
+
+def test_get_voice_mode_no_realtime_key_anywhere(monkeypatch):
+    import jarvis.realtime.factory as rf
+    monkeypatch.setattr(rf, "get_secret_any", lambda _candidates: None)
+    client = TestClient(_app(mode="pipeline"))
+    r = client.get("/api/settings/voice-mode")
+    body = r.json()
+    assert body["realtime_available"] is False
+    assert body["active_provider"] is None
+    assert body["active_provider_label"] is None
+    assert body["active_model"] is None
+
+
+# The codex-subscription-realtime adapter (and its busy/logged-out PUT gates)
+# was removed 2026-08-10; the generic "no ready provider" 400 below is the
+# remaining refusal path for an unavailable realtime engine.
+
+
+def test_put_voice_mode_invalid_is_400():
+    client = TestClient(_app())
+    r = client.put("/api/settings/voice-mode", json={"mode": "bogus", "persist": False})
+    assert r.status_code == 400
+
+
+def test_put_voice_mode_realtime_without_key_is_400(monkeypatch):
+    """A3: PUT-guard rejects selecting realtime when no family has a key —
+    prevents pinning the boot default to an unreachable engine."""
+    import jarvis.realtime.factory as rf
+    monkeypatch.setattr(rf, "get_secret_any", lambda _candidates: None)
+    client = TestClient(_app())
+    r = client.put("/api/settings/voice-mode", json={"mode": "realtime", "persist": False})
+    assert r.status_code == 400
+
+
+def test_put_voice_mode_updates_live_and_persists(monkeypatch):
+    import jarvis.realtime.factory as rf
+    persisted = {"called": False}
+    monkeypatch.setattr(rf, "get_secret_any", lambda _candidates: "sk-x")
+
+    def fake_set(mode, **kw):
+        persisted["called"] = True
+
+    import jarvis.core.config_writer as cw
+    monkeypatch.setattr(cw, "set_voice_mode", fake_set)
+    app = _app()
+    client = TestClient(app)
+    r = client.put("/api/settings/voice-mode", json={"mode": "realtime", "persist": True})
+    assert r.status_code == 200
+    assert r.json() == {
+        "ok": True,
+        "mode": "realtime",
+        "persisted": True,
+        "session_restarted": False,
+    }
+    assert app.state.config.voice.mode == "realtime"
+    assert persisted["called"] is True
+
+
+def test_put_voice_mode_restarts_an_incompatible_active_session(monkeypatch):
+    import jarvis.realtime.factory as rf
+
+    monkeypatch.setattr(rf, "get_secret_any", lambda _candidates: "sk-x")
+    import jarvis.core.config_writer as cw
+
+    monkeypatch.setattr(cw, "set_voice_mode", lambda _mode, **_kw: None)
+
+    applied: list[str] = []
+
+    class LivePipeline:
+        def apply_voice_mode(self, mode: str) -> bool:
+            applied.append(mode)
+            return True
+
+    app = _app(mode="pipeline")
+    app.state.speech_pipeline = LivePipeline()
+    client = TestClient(app)
+
+    response = client.put(
+        "/api/settings/voice-mode",
+        json={"mode": "realtime", "persist": True},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["session_restarted"] is True
+    assert applied == ["realtime"]
+
+
+def test_get_voice_mode_reports_effective_active_engine(monkeypatch):
+    import jarvis.realtime.factory as rf
+
+    monkeypatch.setattr(rf, "get_secret_any", lambda _candidates: "sk-x")
+    app = _app(mode="realtime")
+    app.state.speech_pipeline = SimpleNamespace(
+        voice_engine_status=lambda: {
+            "session_active": True,
+            "active_session_mode": "realtime",
+            "active_session_provider": "openai-realtime",
+            "active_session_model": "gpt-realtime-2.1",
+            "transitioning": False,
+        }
+    )
+    client = TestClient(app)
+
+    body = client.get("/api/settings/voice-mode").json()
+
+    assert body["mode"] == "realtime"
+    assert body["session_active"] is True
+    assert body["active_session_mode"] == "realtime"
+    assert body["active_session_provider"] == "openai-realtime"
+    assert body["active_session_model"] == "gpt-realtime-2.1"
+    assert body["active_session_model_label"] == "GPT Realtime 2.1"
+    assert body["transitioning"] is False
